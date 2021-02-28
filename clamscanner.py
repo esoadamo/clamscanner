@@ -3,6 +3,7 @@ import queue
 import sys
 import time
 import argparse
+import threading
 from multiprocessing import cpu_count
 from pathlib import Path
 from subprocess import Popen, PIPE
@@ -93,14 +94,17 @@ def scan(path: Path, log_file: Optional[TextIO]) -> None:
 
     def thread_write_log():
         last_line_length = 0
+
         while True:
-            if not commands_unfinished.locked():
-                break
+            if not commands_unfinished.locked() and log_lines_to_write.empty():
+                alive_threads = sum(map(lambda _: 1, filter(lambda x: x.is_alive(), threading.enumerate())))
+                if alive_threads <= 2:
+                    break
             try:
                 console, line = log_lines_to_write.get(timeout=1)
                 is_infected = not line.endswith(': OK')
                 spaces = " " * (last_line_length - len(line))
-                print(line + spaces, end='\n' if is_infected else '\r', file=console)
+                print(line + spaces, end='\n' if is_infected else '\r', file=console, flush=True)
 
                 if log_file is not None:
                     log_file.write(line + '\n')
