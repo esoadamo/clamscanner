@@ -201,7 +201,7 @@ def main() -> None:
 
     log_file: Optional[TextIO] = None
     if args.log is not None:
-        log_file = open(args.log, 'w')
+        log_file = open(args.log, 'a')
 
     scan(Path(args.path), log_file, Path(args.cache) if args.cache is not None else None)
 
