@@ -79,7 +79,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                     break
                 except queue.Full:
                     pass
-        print("[SCANNER] Command generation finished")
+        print("\n[SCANNER] Command generation finished")
         commands_unfinished.clear()
 
     def thread_write_log():
@@ -107,7 +107,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
     def thread_scanning():
         while True:
             if not commands_unfinished.is_set():
-                print("[SCANNER] Thread finished")
+                print("\n[SCANNER] Thread finished")
                 break
 
             try:
@@ -127,7 +127,8 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                                 stdout, stderr = p.communicate(input=None, timeout=30)
                                 break
                             except TimeoutExpired:
-                                print(f"[SCANNER] {target} taking longer than it should (f{int(time.time() - time_start)}s)")
+                                print(f"\n[SCANNER] "
+                                      f"{target} taking longer than it should ({int(time.time() - time_start)}s)")
                         stdout, stderr = stdout.strip(), stderr.strip()
                         if stdout:
                             counter['scanned-files'] += 1
@@ -139,7 +140,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                 finally:
                     pass
             except queue.Empty:
-                print("[SCANNER]  ... nothing to do")
+                print("\n[SCANNER]  ... nothing to do")
                 pass
 
     threads: List[Thread] = []
@@ -149,7 +150,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
         t.start()
         threads.append(t)
 
-    print(f"[SCANNER] Starting {cpu_count()} scanning threads")
+    print(f"\n[SCANNER] Starting {cpu_count()} scanning threads")
     for _ in range(cpu_count()):
         t = Thread(target=thread_scanning)
         threads.append(t)
