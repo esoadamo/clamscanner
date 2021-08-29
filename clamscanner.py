@@ -7,9 +7,9 @@ import argparse
 import threading
 from multiprocessing import cpu_count
 from pathlib import Path
-from subprocess import Popen, PIPE
+from subprocess import Popen, PIPE, TimeoutExpired
 from threading import Thread, Lock, Event
-from typing import Dict, List, Tuple, Iterator, Set, Optional, NamedTuple, TextIO
+from typing import List, Tuple, Iterator, Set, Optional, NamedTuple, TextIO
 
 SCAN_COMMAND = Tuple[str, Path]
 
@@ -38,14 +38,7 @@ def generate_scan_commands(path: Path, already_scanned: Optional[AlreadyScannedC
     yield ["DIR_OPEN", path]
 
     try:
-        for child in path.iterdir():
-            if not child.is_dir():
-                continue
-            for sub in generate_scan_commands(child, already_scanned):
-                yield sub
-        for child in path.iterdir():
-            if not child.is_file():
-                continue
+        for child in sorted(path.iterdir(), key=lambda x: 0 if x.is_dir() else 1):
             for sub in generate_scan_commands(child, already_scanned):
                 yield sub
     except (PermissionError, OSError):
@@ -68,9 +61,6 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
     commands: queue.Queue[Tuple[int, SCAN_COMMAND]] = queue.Queue(maxsize=cpu_count() * 20)
     commands_unfinished = Event()
     commands_unfinished.set()
-    processed_command_ids: Set[int] = set()
-    opened_directories: Dict[Path, Dict[str, Set[Path]]] = {}
-    dirs_to_close: queue.Queue[Tuple[int, SCAN_COMMAND]] = queue.Queue(maxsize=cpu_count() * 20)
     log_lines_to_write: queue.Queue[Tuple[TextIO, str]] = queue.Queue(maxsize=cpu_count() * 100)
 
     counter = {
@@ -78,24 +68,6 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
         'infected-files': 0,
         'time-start': time.time()
     }
-
-    def close_finished_directories() -> Iterator[None]:
-        while True:
-            try:
-                command_id, (_, target) = dirs_to_close.get(block=False)
-                while True:
-                    if not processed_command_ids or min(processed_command_ids) >= command_id:
-                        del opened_directories[target]
-                        if target.parent in opened_directories:
-                            opened_directories[target.parent]["open"].remove(target)
-                            opened_directories[target.parent]["done"].add(target)
-                        break
-                    yield
-            except queue.Empty:
-                pass
-            yield
-
-    finished_directories_closer = close_finished_directories()
 
     def thread_commands_generator():
         for i, cmd in enumerate(generate_scan_commands(path, already_scanned_cache)):
@@ -107,6 +79,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                     break
                 except queue.Full:
                     pass
+        print("[SCANNER] Command generation finished")
         commands_unfinished.clear()
 
     def thread_write_log():
@@ -134,19 +107,12 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
     def thread_scanning():
         while True:
             if not commands_unfinished.is_set():
+                print("[SCANNER] Thread finished")
                 break
 
             try:
                 command_id, (command, target) = commands.get(timeout=1)
-                processed_command_ids.add(command_id)
                 try:
-                    if command == "DIR_DONE":
-                        dirs_to_close.put((command_id, (command, target)))
-
-                    if command == "DIR_OPEN":
-                        if target.parent in opened_directories:
-                            opened_directories[target.parent]["open"].add(target)
-                        opened_directories[target] = {"open": set(), "done": set()}
 
                     if command == "FILE_SCAN":
                         p = Popen(["clamdscan", "--fdpass", "--no-summary", target.absolute()],
@@ -155,7 +121,12 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                                   stdout=PIPE,
                                   text=True
                                   )
-                        stdout, stderr = p.communicate(input=None)
+                        while True:
+                            try:
+                                stdout, stderr = p.communicate(input=None, timeout=30)
+                                break
+                            except TimeoutExpired:
+                                print(f"[SCANNER] {target} taking longer than it should")
                         stdout, stderr = stdout.strip(), stderr.strip()
                         if stdout:
                             counter['scanned-files'] += 1
@@ -164,14 +135,10 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                             log_lines_to_write.put((sys.stdout, stdout))
                         if stderr:
                             log_lines_to_write.put((sys.stderr, stderr))
-
                 finally:
-                    processed_command_ids.remove(command_id)
-                    try:
-                        next(finished_directories_closer)
-                    except ValueError:
-                        pass
+                    pass
             except queue.Empty:
+                print("[SCANNER]  ... nothing to do")
                 pass
 
     threads: List[Thread] = []
@@ -181,6 +148,7 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
         t.start()
         threads.append(t)
 
+    print(f"[SCANNER] Starting {cpu_count()} scanning threads")
     for _ in range(cpu_count()):
         t = Thread(target=thread_scanning)
         threads.append(t)
@@ -220,21 +188,6 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
             t.join()
 
         print('Finishing')
-        while True:
-            try:
-                next(finished_directories_closer)
-                break
-            except ValueError:
-                time.sleep(0.5)
-
-        def get_closed_directories() -> List[str]:
-            r: List[str] = []
-            for d, v in opened_directories.items():
-                for c in v.get('done', []):
-                    r.append(f"{c.absolute()}")
-            return r
-
-        print(get_closed_directories())
 
 
 def main() -> None:
