@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import queue
 import sys
 import time
@@ -7,7 +8,7 @@ import threading
 from multiprocessing import cpu_count
 from pathlib import Path
 from subprocess import Popen, PIPE
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from typing import Dict, List, Tuple, Iterator, Set, Optional, NamedTuple, TextIO
 
 SCAN_COMMAND = Tuple[str, Path]
@@ -24,6 +25,7 @@ def generate_scan_commands(path: Path, already_scanned: Optional[AlreadyScannedC
         if already_scanned is not None:
             with already_scanned.lock:
                 if resolved in already_scanned.cache:
+                    print(f"{path}: SKIP")
                     return
                 already_scanned.cache.add(resolved)
     except (FileNotFoundError, RuntimeError):
@@ -52,11 +54,20 @@ def generate_scan_commands(path: Path, already_scanned: Optional[AlreadyScannedC
     yield ["DIR_DONE", path]
 
 
-def scan(path: Path, log_file: Optional[TextIO]) -> None:
-    already_scanned_cache = AlreadyScannedCache(cache=set(), lock=Lock())
+def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = None) -> None:
+    skip_files: Set[Path] = set()
+    if file_cache is not None and file_cache.exists():
+        with file_cache.open('r') as f:
+            skip_files = set(filter(
+                lambda x: x.is_file(),
+                map(lambda x: Path(x), json.load(f))
+            ))
+        print(f'Loaded {len(skip_files)} entries from cache')
+
+    already_scanned_cache = AlreadyScannedCache(cache=skip_files, lock=Lock())
     commands: queue.Queue[Tuple[int, SCAN_COMMAND]] = queue.Queue(maxsize=cpu_count() * 20)
-    commands_unfinished = Lock()
-    commands_unfinished.acquire(blocking=False)
+    commands_unfinished = Event()
+    commands_unfinished.set()
     processed_command_ids: Set[int] = set()
     opened_directories: Dict[Path, Dict[str, Set[Path]]] = {}
     dirs_to_close: queue.Queue[Tuple[int, SCAN_COMMAND]] = queue.Queue(maxsize=cpu_count() * 20)
@@ -88,18 +99,25 @@ def scan(path: Path, log_file: Optional[TextIO]) -> None:
 
     def thread_commands_generator():
         for i, cmd in enumerate(generate_scan_commands(path, already_scanned_cache)):
-            commands.put((i, cmd))
-        if commands_unfinished.locked():
-            commands_unfinished.release()
+            while True:
+                if not commands_unfinished.is_set():
+                    return
+                try:
+                    commands.put((i, cmd), timeout=5)
+                    break
+                except queue.Full:
+                    pass
+        commands_unfinished.clear()
 
     def thread_write_log():
         last_line_length = 0
 
         while True:
-            if not commands_unfinished.locked() and log_lines_to_write.empty():
+            if not commands_unfinished.is_set() and log_lines_to_write.empty():
                 alive_threads = sum(map(lambda _: 1, filter(lambda x: x.is_alive(), threading.enumerate())))
                 if alive_threads <= 2:
                     break
+                print(f'Waiting for log to finish, threads alive: {alive_threads}')
             try:
                 console, line = log_lines_to_write.get(timeout=1)
                 is_infected = not line.endswith(': OK')
@@ -115,7 +133,7 @@ def scan(path: Path, log_file: Optional[TextIO]) -> None:
 
     def thread_scanning():
         while True:
-            if not commands_unfinished.locked():
+            if not commands_unfinished.is_set():
                 break
 
             try:
@@ -134,12 +152,11 @@ def scan(path: Path, log_file: Optional[TextIO]) -> None:
                         p = Popen(["clamdscan", "--fdpass", "--no-summary", target.absolute()],
                                   stdin=PIPE,
                                   stderr=PIPE,
-                                  stdout=PIPE
+                                  stdout=PIPE,
+                                  text=True
                                   )
-                        p.stdin.close()
-                        p.wait()
-                        stdout = p.stdout.read().decode('utf8').strip()
-                        stderr = p.stderr.read().decode('utf8').strip()
+                        stdout, stderr = p.communicate(input=None)
+                        stdout, stderr = stdout.strip(), stderr.strip()
                         if stdout:
                             counter['scanned-files'] += 1
                             if not stdout.endswith(': OK'):
@@ -178,11 +195,31 @@ def scan(path: Path, log_file: Optional[TextIO]) -> None:
         print(f'Scanned files: {counter["scanned-files"]}')
         print(f'Infected files: {counter["infected-files"]}')
     except KeyboardInterrupt:
-        if commands_unfinished.locked():
-            commands_unfinished.release()
+        print("^C received, ending")
+
+        if file_cache is not None:
+            print(f'Saving cache to {file_cache}')
+            with already_scanned_cache.lock:
+                with file_cache.open('w') as f:
+                    json.dump(
+                        list(
+                            map(lambda x: str(x),
+                                filter(
+                                    lambda x: x.is_file(),
+                                    already_scanned_cache.cache
+                                )
+                                )
+                        ),
+                        f
+                    )
+            print('Cache saved')
+
+        commands_unfinished.clear()
+        print('Waiting for other thread to terminate')
         for t in threads:
             t.join()
 
+        print('Finishing')
         while True:
             try:
                 next(finished_directories_closer)
@@ -205,13 +242,14 @@ def main() -> None:
     parser.add_argument('path', metavar='path', type=str,
                         help='a path to scan')
     parser.add_argument('--log', dest='log', type=str, help='log file to write information to', default=None)
+    parser.add_argument('--cache', dest='cache', type=str, help='where to store scanned cache info', default=None)
     args = parser.parse_args()
 
     log_file: Optional[TextIO] = None
     if args.log is not None:
         log_file = open(args.log, 'w')
 
-    scan(Path(args.path), log_file)
+    scan(Path(args.path), log_file, Path(args.cache) if args.cache is not None else None)
 
     if log_file is not None:
         log_file.flush()
