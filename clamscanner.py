@@ -121,12 +121,13 @@ def scan(path: Path, log_file: Optional[TextIO], file_cache: Optional[Path] = No
                                   stdout=PIPE,
                                   text=True
                                   )
+                        time_start = time.time()
                         while True:
                             try:
                                 stdout, stderr = p.communicate(input=None, timeout=30)
                                 break
                             except TimeoutExpired:
-                                print(f"[SCANNER] {target} taking longer than it should")
+                                print(f"[SCANNER] {target} taking longer than it should (f{int(time.time() - time_start)}s)")
                         stdout, stderr = stdout.strip(), stderr.strip()
                         if stdout:
                             counter['scanned-files'] += 1
